@@ -257,6 +257,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             clear_cache,
             no_cache,
             json,
+            output,
             auto_snapshot,
             diff,
             wasm_new,
@@ -298,6 +299,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 wasm_new.as_deref(),
                 dry_run,
                 project.as_deref(),
+                output.as_deref(),
             )
             .await
         }
@@ -309,6 +311,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
             no_cache,
             fn_names,
             json,
+            output,
             auto_snapshot,
         } => {
             let format = match (args.format, json) {
@@ -334,6 +337,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 args.wasm_info,
                 args.verbose,
                 auto_snapshot,
+                output.as_deref(),
             )
             .await
         }
@@ -381,6 +385,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                 threshold_percent,
                 summary,
                 json,
+                output,
             } => {
                 // `--format` wins when supplied; otherwise the legacy
                 // `--json` flag selects JSON on top of the config-file
@@ -397,6 +402,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                         threshold_percent,
                         summary,
                         diff_format == cli::OutputFormat::Json,
+                        output.as_deref(),
                     )
                 } else {
                     cmd_config_diff(
@@ -413,6 +419,7 @@ async fn run(args: cli::Cli) -> error::AppResult<()> {
                         max_retries,
                         &headers,
                         verbose,
+                        output.as_deref(),
                     )
                     .await
                 }
@@ -865,6 +872,7 @@ async fn cmd_estimate(
     wasm_new: Option<&str>,
     dry_run: bool,
     project: Option<&str>,
+    output_path: Option<&std::path::Path>,
 ) -> error::AppResult<()> {
     // Parse the requested projection counts up front so an invalid list is
     // rejected before any RPC traffic, regardless of the output format.
@@ -899,6 +907,7 @@ async fn cmd_estimate(
             precision,
             extra_headers,
             verbose,
+            output_path,
         )
         .await;
     }
@@ -943,10 +952,11 @@ async fn cmd_estimate(
         timeout,
         connect_timeout,
         max_retries,
-        format == "table",
-        wasm_info_flag,
+        format == "table" && output_path.is_none(),
+        wasm_info_flag && output_path.is_none(),
         verbose,
         dry_run,
+        output_path,
     )
     .await?;
 
@@ -974,44 +984,46 @@ async fn cmd_estimate(
         // `--compare` takes precedence over the plain render below: it prints
         // the report *and* the delta section against the previous estimate.
         if compare {
-            print_report_with_comparison(report, previous.as_ref(), format, format == "json")?;
+            let rendered =
+                format_report_with_comparison(report, previous.as_ref(), format, format == "json")?;
+            emit_command_output(output_path, &rendered)?;
         } else if format == "table" {
             // The table formatter is the only one that renders the fee bar
             // chart, and only when the terminal has room for it
             // (>= MIN_CHART_WIDTH columns), stdout is a TTY, and `--quiet` was
             // not passed. Machine formats never grow a human-only chart.
-            match cli::chart_width() {
+            match if output_path.is_some() {
+                None
+            } else {
+                cli::chart_width()
+            } {
                 Some(width) => {
-                    println!(
-                        "{}",
-                        TableFormatter.format_with_options(report, true, width)
-                    );
+                    emit_command_output(
+                        output_path,
+                        &TableFormatter.format_with_options(report, true, width),
+                    )?;
                 }
                 None => {
-                    println!(
-                        "{}",
-                        TableFormatter.format_with_options(
+                    emit_command_output(
+                        output_path,
+                        &TableFormatter.format_with_options(
                             report,
                             false,
                             report::cost_report::DEFAULT_CHART_WIDTH,
-                        )
-                    );
+                        ),
+                    )?;
                 }
             }
         } else {
-            match formatter_by_name(format) {
-                Some(formatter) => println!("{}", formatter.format(report)),
-                None => {
-                    println!(
-                        "{}",
-                        TableFormatter.format_with_options(
-                            report,
-                            false,
-                            report::cost_report::DEFAULT_CHART_WIDTH,
-                        )
-                    );
-                }
-            }
+            let rendered = match formatter_by_name(format) {
+                Some(formatter) => formatter.format(report),
+                None => TableFormatter.format_with_options(
+                    report,
+                    false,
+                    report::cost_report::DEFAULT_CHART_WIDTH,
+                ),
+            };
+            emit_command_output(output_path, &rendered)?;
         }
     }
 
@@ -1075,6 +1087,7 @@ async fn estimate_once(
     wasm_info_flag: bool,
     verbose: bool,
     dry_run: bool,
+    output_path: Option<&std::path::Path>,
 ) -> error::AppResult<EstimateRun> {
     let json_flag = format == "json";
     let table_mode = format == "table";
@@ -1097,9 +1110,9 @@ async fn estimate_once(
         if clear_cache {
             let cleared = cache::clear_cache(network)?;
             let message = format!("Cleared {cleared} cached estimate(s) for {network}.");
-            if table_mode {
+            if table_mode && output_path.is_none() {
                 println!("{message}");
-            } else {
+            } else if output_path.is_none() {
                 eprintln!("{message}");
             }
         }
@@ -1111,7 +1124,12 @@ async fn estimate_once(
             has_spec = wasm_info.has_spec,
             "WASM loaded"
         );
-        emit_wasm_structure(&wasm_info, verbose, wasm_info_flag, json_flag);
+        emit_wasm_structure(
+            &wasm_info,
+            verbose && output_path.is_none(),
+            wasm_info_flag && output_path.is_none(),
+            json_flag,
+        );
 
         // Validate WASM memory and table constraints against network limits (defaults: 64KB max size, 2048 pages)
         wasm_info.validate_wasm_limits(65536, 2048)?;
@@ -1149,7 +1167,8 @@ async fn estimate_once(
         if let Some(fresh) = fresh {
             let ttl_secs = ttl_secs.unwrap_or_default();
             info!(ttl_secs, function = %function_name, "cache hit — reusing fresh estimate");
-            print_cached_estimate(&fresh, ttl_secs, json_flag, precision);
+            let rendered = format_cached_estimate(&fresh, ttl_secs, json_flag, precision);
+            emit_command_output(output_path, &rendered)?;
             return Ok(EstimateRun::Cached);
         }
 
@@ -1434,6 +1453,7 @@ async fn emit_watch_estimate(
         verbose,
         // `--watch` wins over `--dry-run`: watching exists to re-simulate.
         false,
+        None,
     )
     .await
     {
@@ -1692,6 +1712,7 @@ async fn cmd_estimate_diff(
     precision: u32,
     extra_headers: &[String],
     verbose: bool,
+    output_path: Option<&std::path::Path>,
 ) -> error::AppResult<()> {
     use sha2::Digest;
 
@@ -1709,11 +1730,11 @@ async fn cmd_estimate_diff(
     let old_hash = hex::encode(sha2::Sha256::digest(&old_info.bytes));
     let new_hash = hex::encode(sha2::Sha256::digest(&new_info.bytes));
 
-    if format == "table" {
-        println!("Old WASM SHA-256: {old_hash}");
-        println!("New WASM SHA-256: {new_hash}");
-        println!();
-    }
+    let header = if format == "table" {
+        format!("Old WASM SHA-256: {old_hash}\nNew WASM SHA-256: {new_hash}\n\n")
+    } else {
+        String::new()
+    };
 
     let old_report = simulate_report(&SimulationRequest {
         wasm_bytes: &old_info.bytes,
@@ -1759,26 +1780,59 @@ async fn cmd_estimate_diff(
     })
     .await?;
 
-    if format == "json" {
+    let rendered = if format == "json" {
         let diff = report::diff::build_cost_report_diff(&old_report, &new_report);
-        println!("{}", serde_json::to_string_pretty(&diff)?);
+        serde_json::to_string_pretty(&diff)?
     } else {
-        println!(
-            "{}",
-            report::diff::format_cost_report_diff(&old_report, &new_report)
-        );
-    }
+        report::diff::format_cost_report_diff(&old_report, &new_report)
+    };
+    emit_command_output(output_path, &format!("{header}{rendered}"))?;
 
     Ok(())
 }
 
 /// Prints a cost report using the formatter for `format`, falling back to the
 /// plain table for an unknown format.
-fn print_report(report: &report::cost_report::CostReport, format: &str) {
+fn format_report(report: &report::cost_report::CostReport, format: &str) -> String {
     match formatter_by_name(format) {
-        Some(formatter) => println!("{}", formatter.format(report)),
-        None => println!("{}", TableFormatter.format(report)),
+        Some(formatter) => formatter.format(report),
+        None => TableFormatter.format(report),
     }
+}
+
+/// Write rendered command output to a file, creating missing parent directories.
+/// Without a destination, preserve the normal stdout behavior.
+fn emit_command_output(
+    output_path: Option<&std::path::Path>,
+    output: &str,
+) -> error::AppResult<()> {
+    if let Some(path) = output_path {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                error::AppError::General(format!(
+                    "failed to create output directory '{}': {error}",
+                    parent.display()
+                ))
+            })?;
+        }
+        let contents = if output.ends_with('\n') {
+            output.to_string()
+        } else {
+            format!("{output}\n")
+        };
+        std::fs::write(path, contents).map_err(|error| {
+            error::AppError::General(format!(
+                "failed to write output file '{}': {error}",
+                path.display()
+            ))
+        })?;
+    } else {
+        println!("{output}");
+    }
+    Ok(())
 }
 
 /// Builds the delta between `previous` and `report`, or `None` when there is
@@ -1809,18 +1863,18 @@ fn report_json_value(
     Ok(serde_json::from_str(&formatted)?)
 }
 
-/// Prints the report followed by its `--compare` section.
+/// Formats the report followed by its `--compare` section.
 ///
 /// JSON gets a single merged payload (`previous_estimate` + `delta` keys) so
 /// the output stays one parseable document; the human-readable formats get the
 /// report first and then the delta table. With nothing cached to compare
 /// against, the notice replaces the table.
-fn print_report_with_comparison(
+fn format_report_with_comparison(
     report: &report::cost_report::CostReport,
     previous: Option<&cache::CachedEstimate>,
     format: &str,
     json_flag: bool,
-) -> error::AppResult<()> {
+) -> error::AppResult<String> {
     let delta = cost_delta(previous, report);
 
     if json_flag {
@@ -1835,25 +1889,33 @@ fn print_report_with_comparison(
             map.insert("previous_estimate".to_string(), previous_value);
             map.insert("delta".to_string(), delta_value);
         }
-        println!("{}", serde_json::to_string_pretty(&value)?);
-        return Ok(());
+        return Ok(serde_json::to_string_pretty(&value)?);
     }
 
-    print_report(report, format);
+    let mut output = format_report(report, format);
 
     match delta {
         Some(delta) => match format {
-            "markdown" => println!("{}", delta.format_markdown()),
-            "csv" => println!(
-                "\n# cost delta vs previous estimate\n{}",
+            "markdown" => {
+                output.push('\n');
+                output.push_str(&delta.format_markdown());
+            }
+            "csv" => output.push_str(&format!(
+                "\n\n# cost delta vs previous estimate\n{}",
                 delta.format_csv()
-            ),
-            _ => println!("{}", delta.format_text()),
+            )),
+            _ => {
+                output.push('\n');
+                output.push_str(&delta.format_text());
+            }
         },
-        None => println!("No previous estimate found for comparison"),
+        None => {
+            output.push('\n');
+            output.push_str("No previous estimate found for comparison");
+        }
     }
 
-    Ok(())
+    Ok(output)
 }
 
 /// Converts an `EstimateAllResult` to a CSV row.
@@ -1908,15 +1970,22 @@ async fn cmd_estimate_all(
     wasm_info_flag: bool,
     verbose: bool,
     auto_snapshot: bool,
+    output_path: Option<&std::path::Path>,
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::info_span;
 
     let span = info_span!("cmd_estimate_all", wasm_path, network);
     async {
+        let capture_output = output_path.is_some();
         let wasm_info = wasm::parser::load_wasm(std::path::Path::new(wasm_path))?;
         let json_flag = format == "json";
-        emit_wasm_structure(&wasm_info, verbose, wasm_info_flag, json_flag);
+        emit_wasm_structure(
+            &wasm_info,
+            verbose && !capture_output,
+            wasm_info_flag && !capture_output,
+            json_flag,
+        );
 
         // Confirm the exact file being estimated up front — printed before any
         // endpoint resolution or simulation, so the hash is visible even when
@@ -1956,7 +2025,7 @@ async fn cmd_estimate_all(
 
         let json_flag = format == "json";
         let text_mode = format == "table" || format == "markdown";
-        if text_mode {
+        if text_mode && !capture_output {
             println!("WASM SHA-256: {wasm_hash}");
             println!();
             println!("{}", wasm::parser::format_module_metadata(&wasm_info));
@@ -2023,12 +2092,12 @@ async fn cmd_estimate_all(
 
         let mut csv_rows: Vec<String> = Vec::new();
 
-        let mut json_results: Vec<EstimateAllResult> = Vec::new();
+        let mut results: Vec<EstimateAllResult> = Vec::new();
         let total = selected.len();
         debug!(total, "enumerated functions");
 
         for (i, fn_info) in selected.iter().enumerate() {
-            if text_mode {
+            if text_mode && !capture_output {
                 println!("[{}/{}] {}", i + 1, total, fn_info.name);
             }
             let result = estimate_all_function(
@@ -2042,12 +2111,14 @@ async fn cmd_estimate_all(
                 json_flag,
                 fee_rates.as_ref(),
                 precision,
+                !capture_output,
             )
             .await?;
+            results.push(result.clone());
             if format == "csv" {
                 let row = csv_row(&result);
                 csv_rows.push(row);
-            } else if format == "markdown" {
+            } else if format == "markdown" && !capture_output {
                 let r = &result;
                 println!("### {}\n", r.function);
                 if r.status == EstimateAllStatus::Ok {
@@ -2070,8 +2141,6 @@ async fn cmd_estimate_all(
                     }
                 }
                 println!();
-            } else {
-                json_results.push(result);
             }
         }
 
@@ -2097,20 +2166,36 @@ async fn cmd_estimate_all(
         // estimated function (#328): min/max/mean/median/stddev fees and
         // min/max/mean CPU instructions for the whole batch. Skipped and
         // errored functions carry no fee/CPU figure and are excluded.
-        let fees: Vec<i64> = json_results
+        let fees: Vec<i64> = results
             .iter()
             .filter_map(|r| r.fee.as_ref().map(|f| f.total_stroops))
             .collect();
-        let cpu: Vec<u64> = json_results
+        let cpu: Vec<u64> = results
             .iter()
             .filter_map(|r| r.cpu_instructions)
             .collect();
         let fee_distribution = report::cost_report::FeeDistribution::from_samples(&fees, &cpu);
-        emit_fee_distribution_summary(&fee_distribution, format == "json", precision);
+        if !capture_output {
+            emit_fee_distribution_summary(&fee_distribution, format == "json", precision);
+        }
 
-        if format == "json" {
+        if let Some(output_path) = output_path {
+            let rendered = match format {
+                "json" => serde_json::to_string_pretty(&EstimateAllJsonReport {
+                    functions: results,
+                    fee_distribution,
+                })?,
+                "csv" => format!(
+                    "function,network,ledger,wasm_hash,cpu_instructions,memory_bytes,read_entries,write_entries,read_bytes,write_bytes,tx_size,non_refundable_stroops,refundable_stroops,total_stroops,total_xlm\n{}",
+                    csv_rows.join("\n")
+                ),
+                "markdown" => format_estimate_all_markdown(&results),
+                _ => format_estimate_all_table(&results, &fee_distribution, precision),
+            };
+            emit_command_output(Some(output_path), &rendered)?;
+        } else if format == "json" {
             let report = EstimateAllJsonReport {
-                functions: json_results,
+                functions: results,
                 fee_distribution,
             };
             println!("{}", serde_json::to_string_pretty(&report)?);
@@ -2165,16 +2250,18 @@ async fn estimate_all_function(
     json_flag: bool,
     fee_rates: Option<&report::fee_calc::FeeRates>,
     precision: u32,
+    emit_text: bool,
 ) -> error::AppResult<EstimateAllResult> {
     use tracing::{Instrument, debug, info_span};
 
     let span =
         info_span!("estimate_all_function", fn = %fn_info.name, param_count = fn_info.param_count);
     async {
+        let show_progress = !json_flag && emit_text;
         if fn_info.param_count > 0 {
             let reason = format!("needs --fn/--arg ({} param(s))", fn_info.param_count);
             debug!(reason, "skipping function");
-            if !json_flag {
+            if show_progress {
                 println!("── Estimating '{}' ── Skipped: {reason}", fn_info.name);
             }
             return Ok(EstimateAllResult::skipped(&fn_info.name, reason));
@@ -2189,7 +2276,7 @@ async fn estimate_all_function(
             Ok(tx) => tx,
             Err(e) => {
                 debug!(error = %e, "tx construction failed");
-                if !json_flag {
+                if show_progress {
                     eprintln!("── Estimating '{}' ── Skipped: {e}", fn_info.name);
                 }
                 return Ok(EstimateAllResult::skipped(&fn_info.name, e.to_string()));
@@ -2205,7 +2292,7 @@ async fn estimate_all_function(
                 if missing_simulation_data(&resp) {
                     let msg = "simulation returned no cost data and no latest ledger — check --id and the RPC endpoint";
                     debug!(msg, "simulation missing data");
-                    if !json_flag {
+                    if show_progress {
                         eprintln!("── Estimating '{}' ── Error: {msg}", fn_info.name);
                     }
                     return Ok(EstimateAllResult::errored(&fn_info.name, msg));
@@ -2268,7 +2355,7 @@ async fn estimate_all_function(
                     },
                 };
 
-                if !json_flag {
+                if show_progress {
                     println!(
                         "CPU: {cpu} insns | Mem: {mem} bytes | Fee: {total_fee} stroops ({xlm} XLM) | Ledger: {ledger}"
                     );
@@ -2295,7 +2382,7 @@ async fn estimate_all_function(
             }
             Err(e) => {
                 debug!(error = %e, "simulation failed");
-                if !json_flag {
+                if show_progress {
                     eprintln!("Skipped — simulation failed: {e}");
                 }
                 Ok(EstimateAllResult::errored(&fn_info.name, e.to_string()))
@@ -2304,6 +2391,112 @@ async fn estimate_all_function(
     }
     .instrument(span)
     .await
+}
+
+fn format_estimate_all_table(
+    results: &[EstimateAllResult],
+    distribution: &report::cost_report::FeeDistribution,
+    precision: u32,
+) -> String {
+    let mut table = Table::new();
+    table.set_header(vec![
+        Cell::new("Function"),
+        Cell::new("Status"),
+        Cell::new("CPU instructions"),
+        Cell::new("Memory bytes"),
+        Cell::new("Fee (stroops)"),
+        Cell::new("Ledger"),
+        Cell::new("Details"),
+    ]);
+    for result in results {
+        let status = match result.status {
+            EstimateAllStatus::Ok => "ok",
+            EstimateAllStatus::Skipped => "skipped",
+            EstimateAllStatus::Error => "error",
+        };
+        table.add_row(vec![
+            Cell::new(&result.function),
+            Cell::new(status),
+            Cell::new(
+                result
+                    .cpu_instructions
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+            ),
+            Cell::new(
+                result
+                    .memory_bytes
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+            ),
+            Cell::new(
+                result
+                    .fee
+                    .as_ref()
+                    .map(|fee| fee.total_stroops.to_string())
+                    .unwrap_or_default(),
+            ),
+            Cell::new(
+                result
+                    .ledger
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+            ),
+            Cell::new(
+                result
+                    .reason
+                    .as_deref()
+                    .or(result.error.as_deref())
+                    .unwrap_or_default(),
+            ),
+        ]);
+    }
+    format!(
+        "{}\n\n{}",
+        table,
+        report::cost_report::format_distribution_box(distribution, precision)
+    )
+}
+
+fn format_estimate_all_markdown(results: &[EstimateAllResult]) -> String {
+    let mut output = String::from(
+        "| Function | Status | CPU instructions | Memory bytes | Fee (stroops) | Ledger | Details |\n| --- | --- | ---: | ---: | ---: | ---: | --- |",
+    );
+    for result in results {
+        let status = match result.status {
+            EstimateAllStatus::Ok => "ok",
+            EstimateAllStatus::Skipped => "skipped",
+            EstimateAllStatus::Error => "error",
+        };
+        let fee = result
+            .fee
+            .as_ref()
+            .map(|fee| fee.total_stroops.to_string())
+            .unwrap_or_default();
+        let details = result
+            .reason
+            .as_deref()
+            .or(result.error.as_deref())
+            .unwrap_or_default();
+        output.push_str(&format!(
+            "\n| {} | {status} | {} | {} | {fee} | {} | {} |",
+            result.function,
+            result
+                .cpu_instructions
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            result
+                .memory_bytes
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            result
+                .ledger
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            details.replace('|', "\\|").replace('\n', " "),
+        ));
+    }
+    output
 }
 
 /// `wasm-info` command: print WASM metadata without making any RPC calls.
@@ -2622,6 +2815,7 @@ async fn cmd_config_diff(
     max_retries: usize,
     extra_headers: &[String],
     verbose: bool,
+    output_path: Option<&std::path::Path>,
 ) -> error::AppResult<()> {
     use tracing::Instrument;
     use tracing::{debug, info_span};
@@ -2663,35 +2857,33 @@ async fn cmd_config_diff(
             has_pricing = diff.has_pricing_changes,
             "diff computed"
         );
-        if json_flag {
+        let rendered = if json_flag {
             let json_output = serde_json::json!({
                 "diff": diff,
                 "stale_estimates": stale_estimates_for(network, new_snapshot.ledger),
             });
-            println!("{}", serde_json::to_string_pretty(&json_output)?);
+            serde_json::to_string_pretty(&json_output)?
         } else if format == cli::OutputFormat::Csv {
-            println!("{}", config_snapshot::diff::format_diff_csv(&diff));
+            config_snapshot::diff::format_diff_csv(&diff)
         } else if format == cli::OutputFormat::Markdown {
-            println!("{}", config_snapshot::diff::format_diff_markdown(&diff));
+            config_snapshot::diff::format_diff_markdown(&diff)
         } else if summary {
-            println!("{}", config_snapshot::diff::format_diff_summary(&diff));
+            config_snapshot::diff::format_diff_summary(&diff)
         } else {
-            println!(
-                "{}",
-                config_snapshot::diff::format_diff(
-                    &diff,
-                    cli::should_colorize(),
-                    pricing_only,
-                    threshold_percent
-                )
-            );
-        }
+            config_snapshot::diff::format_diff(
+                &diff,
+                cli::should_colorize() && output_path.is_none(),
+                pricing_only,
+                threshold_percent,
+            )
+        };
+        emit_command_output(output_path, &rendered)?;
 
         if upgrade_detected(&diff) {
             match config_snapshot::store::save_snapshot(&new_snapshot, None) {
                 Ok(path) => {
                     info!(path = %path.display(), "auto-saved post-upgrade snapshot");
-                    if !machine && !summary {
+                    if !machine && !summary && output_path.is_none() {
                         println!(
                             "  Protocol upgrade detected — new config auto-saved to {}",
                             path.display()
@@ -2707,7 +2899,7 @@ async fn cmd_config_diff(
             }
         }
 
-        if !machine && !summary {
+        if !machine && !summary && output_path.is_none() {
             print_stale_estimates(network, new_snapshot.ledger);
         }
 
@@ -2744,6 +2936,7 @@ fn cmd_config_diff_against_previous(
     threshold_percent: Option<f64>,
     summary: bool,
     json_flag: bool,
+    output_path: Option<&std::path::Path>,
 ) -> error::AppResult<()> {
     debug!(network, "diffing the two most recent snapshots");
     let (old_snapshot, new_snapshot) = config_snapshot::store::load_last_two_snapshots(network)?;
@@ -2754,26 +2947,27 @@ fn cmd_config_diff_against_previous(
         "diff computed"
     );
 
-    if json_flag {
+    let rendered = if json_flag {
         let json_output = serde_json::json!({
             "diff": diff,
             "stale_estimates": stale_estimates_for(network, new_snapshot.ledger),
         });
-        println!("{}", serde_json::to_string_pretty(&json_output)?);
+        serde_json::to_string_pretty(&json_output)?
     } else if summary {
-        println!("{}", config_snapshot::diff::format_diff_summary(&diff));
+        config_snapshot::diff::format_diff_summary(&diff)
     } else {
-        println!(
-            "{}",
-            config_snapshot::diff::format_diff(
-                &diff,
-                cli::should_colorize(),
-                pricing_only,
-                threshold_percent,
-            )
+        let diff_output = config_snapshot::diff::format_diff(
+            &diff,
+            cli::should_colorize() && output_path.is_none(),
+            pricing_only,
+            threshold_percent,
         );
-        print_stale_estimates(network, new_snapshot.ledger);
-    }
+        if output_path.is_none() {
+            print_stale_estimates(network, new_snapshot.ledger);
+        }
+        diff_output
+    };
+    emit_command_output(output_path, &rendered)?;
 
     let should_exit = match threshold_percent {
         Some(t) => diff.has_significant_pricing_changes(t),
@@ -2836,38 +3030,33 @@ fn fresh_cached_estimate(
 ///
 /// # Network calls
 /// None — pure output.
-fn print_cached_estimate(
+fn format_cached_estimate(
     fresh: &cache::CachedEstimate,
     ttl_secs: u64,
     json_flag: bool,
     precision: u32,
-) {
+) -> String {
     if json_flag {
-        println!(
-            "{}",
-            serde_json::json!({
-                "cache": "hit",
-                "function": fresh.function,
-                "ledger": fresh.ledger,
-                "total_stroops": fresh.total_stroops,
-                "cpu_instructions": fresh.cpu_instructions,
-                "memory_bytes": fresh.memory_bytes,
-                "timestamp": fresh.timestamp,
-            })
-        );
+        serde_json::json!({
+            "cache": "hit",
+            "function": fresh.function,
+            "ledger": fresh.ledger,
+            "total_stroops": fresh.total_stroops,
+            "cpu_instructions": fresh.cpu_instructions,
+            "memory_bytes": fresh.memory_bytes,
+            "timestamp": fresh.timestamp,
+        })
+        .to_string()
     } else {
-        println!(
-            "Cache hit — estimate from {} is still fresh (TTL {ttl_secs}s); skipping simulation.",
-            fresh.timestamp
-        );
-        println!(
-            "  Total fee: {} stroops ({} XLM) | CPU: {} insns | Mem: {} bytes | Ledger: {}",
+        format!(
+            "Cache hit — estimate from {} is still fresh (TTL {ttl_secs}s); skipping simulation.\n  Total fee: {} stroops ({} XLM) | CPU: {} insns | Mem: {} bytes | Ledger: {}",
+            fresh.timestamp,
             fresh.total_stroops,
             report::fee_calc::stroops_to_xlm(fresh.total_stroops, precision),
             fresh.cpu_instructions,
             fresh.memory_bytes,
             fresh.ledger,
-        );
+        )
     }
 }
 
@@ -3573,6 +3762,7 @@ async fn cmd_cache_warm(
         false,
         verbose,
         false,
+        None,
     )
     .await
 }

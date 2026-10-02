@@ -173,6 +173,10 @@ pub enum Command {
         #[arg(long)]
         json: bool,
 
+        /// Write the rendered estimate to a file, creating parent directories.
+        #[arg(long, short, conflicts_with_all = ["watch", "dry_run"])]
+        output: Option<std::path::PathBuf>,
+
         /// Automatically save a new config snapshot if network pricing
         /// configuration has changed since the last snapshot.
         #[arg(long)]
@@ -235,6 +239,10 @@ pub enum Command {
 
         #[arg(long)]
         json: bool,
+
+        /// Write the rendered estimate results to a file, creating parent directories.
+        #[arg(long, short)]
+        output: Option<std::path::PathBuf>,
 
         /// Automatically save a new config snapshot if network pricing
         /// configuration has changed since the last snapshot.
@@ -420,6 +428,10 @@ pub enum ConfigAction {
         /// Output as JSON instead of a human-readable diff.
         #[arg(long)]
         json: bool,
+
+        /// Write the rendered diff to a file, creating parent directories.
+        #[arg(long, short)]
+        output: Option<std::path::PathBuf>,
     },
     History {
         #[arg(long, default_value = "testnet")]

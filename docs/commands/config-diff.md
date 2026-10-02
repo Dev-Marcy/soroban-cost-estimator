@@ -14,6 +14,7 @@ Options:
       --against-previous   Diff the two most recent on-disk snapshots against each other
                            instead of the live network (conflicts with --against)
       --summary            Print a single-line count summary instead of the full diff
+  -o, --output <PATH>      Write the rendered diff to a file (creates parent directories)
   -h, --help               Print help
 ```
 
@@ -27,6 +28,9 @@ Options:
   recorded at an earlier ledger as potentially stale.
 - **Exit code 0** when nothing changed; **exit code 1** when a pricing change
   was detected — scripts and CI can branch on it.
+- **`--output <PATH>` / `-o`** writes the rendered diff to a file instead of
+  stdout and creates missing parent directories. Table, JSON, CSV, and
+  Markdown formats work in live and `--against-previous` modes.
 - `--summary` prints a single line, `X pricing changes, Y non-pricing changes`
   (and suppresses the stale-cache and auto-save chatter), so you can read it
   directly into a CI status line. The exit code and auto-save side effects are

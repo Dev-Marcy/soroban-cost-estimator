@@ -54,6 +54,7 @@ soroban-cost-estimator estimate [OPTIONS] --wasm <WASM>
 | `--diff` | | | `false` | Compare two WASM builds side by side. Requires `--wasm-new` |
 | `--wasm-new <PATH>` | | | — | The "new" WASM build to compare against when `--diff` is set |
 | `--json` | | | `false` | Output as JSON instead of a human-readable table |
+| `--output <PATH>` | `-o` | | — | Write the rendered report to a file, creating parent directories |
 | `--format <FORMAT>` | | | `table` | Output format: `table`, `json`, `csv`, or `markdown` (overrides `--json`) |
 | `--precision <N>` | | | `7` | Decimal places for XLM fee values (`0..=18`) |
 | `--help` | `-h` | | | Print help |
@@ -229,6 +230,7 @@ soroban-cost-estimator estimate-all [OPTIONS] --wasm <WASM>
 | `--id <ID>` | | | — | Deployed contract ID (64 hex chars) to invoke each function against |
 | `--no-cache` | | | `false` | Bypass the cache entirely: never read cached estimates, never write fresh results |
 | `--json` | | | `false` | Output as JSON instead of a human-readable list |
+| `--output <PATH>` | `-o` | | — | Write the rendered results to a file, creating parent directories |
 | `--help` | `-h` | | | Print help |
 
 **Behavior**
@@ -413,6 +415,7 @@ soroban-cost-estimator config diff [OPTIONS]
 | `--summary` | | `false` | Print a single-line count summary instead of the full diff (for CI status lines) |
 | `--format <FORMAT>` | | `table` | Output format: `table`, `json`, `csv`, or `markdown` |
 | `--json` | | `false` | Legacy alias for `--format json` |
+| `--output <PATH>` | `-o` | | — | Write the rendered diff to a file, creating parent directories |
 | `--help` `-h` | | | Print help |
 
 **Behavior**
